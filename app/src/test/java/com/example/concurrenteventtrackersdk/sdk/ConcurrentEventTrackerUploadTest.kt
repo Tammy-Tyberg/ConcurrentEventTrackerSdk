@@ -50,7 +50,7 @@ class ConcurrentEventTrackerUploadTest {
         fakeRepository = FakeEventRepository()
         fakeUploader = FakeEventUploader()
         trackerScope = CoroutineScope(testDispatcher + SupervisorJob())
-        tempDir = createTempDir("upload-integration-test")
+        tempDir = kotlin.io.path.createTempDirectory("upload-integration-test").toFile()
     }
 
     @After

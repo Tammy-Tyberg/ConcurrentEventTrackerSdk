@@ -45,7 +45,7 @@ class UploadFlushedEventsUseCaseTest {
     fun setUp() {
         fakeRepository = FakeEventRepository()
         fakeUploader = FakeEventUploader()
-        tempDir = createTempDir("sdk-upload-test")
+        tempDir = kotlin.io.path.createTempDirectory("sdk-upload-test").toFile()
         useCase = makeUseCase()
     }
 

@@ -37,7 +37,7 @@ class OkHttpEventUploaderTest {
     @Before
     fun setUp() {
         server.start()
-        tempDir = createTempDir("okhttp-uploader-test")
+        tempDir = kotlin.io.path.createTempDirectory("okhttp-uploader-test").toFile()
     }
 
     @After

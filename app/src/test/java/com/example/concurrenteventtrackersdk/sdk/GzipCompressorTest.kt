@@ -18,7 +18,7 @@ class GzipCompressorTest {
 
     @Before
     fun setUp() {
-        tempDir = createTempDir("gzip-test")
+        tempDir = kotlin.io.path.createTempDirectory("gzip-test").toFile()
     }
 
     @After

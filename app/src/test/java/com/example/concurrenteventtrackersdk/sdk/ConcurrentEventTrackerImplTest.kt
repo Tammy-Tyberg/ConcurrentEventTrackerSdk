@@ -67,7 +67,7 @@ class ConcurrentEventTrackerImplTest {
      */
     private fun makeUploadUseCase(): UploadFlushedEventsUseCase {
         val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
-        val tempDir = createTempDir("tracker-impl-test")
+        val tempDir = kotlin.io.path.createTempDirectory("tracker-impl-test").toFile()
         return UploadFlushedEventsUseCase(
             repository = fakeRepository,
             payloadWriter = EventPayloadWriter(json),
