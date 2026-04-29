@@ -1,18 +1,24 @@
 # ConcurrentEventTracker SDK
 
-A thread-safe, lifecycle-aware Android SDK for buffering analytics events in memory, persisting them to Room, and uploading them as a compressed JSON payload over HTTP.
+A thread-safe Android/Kotlin SDK component for tracking custom events, buffering them in memory, persisting them to Room, and uploading them as a compressed JSON payload.
+
+The project demonstrates a common analytics/telemetry SDK flow:
+
+```text
+track events → buffer in memory → flush to Room → JSON file → GZIP → multipart upload
+```
 
 ---
 
 ## Public API
 
 ```kotlin
-fun trackEvent(event: Event)        // Thread-safe. Call from any thread.
-suspend fun uploadFlushedEvents()   // Flush → JSON → GZIP → HTTP POST → delete on success.
-fun shutdown()                      // Graceful, non-blocking. Best-effort flush.
-```
+fun trackEvent(event: Event)
 
-**`Event`** is the only public model:
+suspend fun uploadFlushedEvents()
+
+fun shutdown()
+```
 
 ```kotlin
 @Serializable
@@ -25,161 +31,181 @@ data class Event(
 
 ---
 
-## Architecture
+## Features
 
-The SDK is organized into three layers:
-
-```
-sdk/
-├── ConcurrentEventTracker.kt          public interface
-├── ConcurrentEventTrackerImpl.kt      @Singleton Channel/actor implementation
-├── TrackerCommand.kt                  sealed interface: Track | Flush | FlushAndAck | Shutdown
-│
-├── domain/
-│   ├── model/
-│   │   ├── Event.kt                   public @Serializable data class
-│   │   └── TrackedEvent.kt            internal — adds sequence:Long for ordering
-│   ├── repository/
-│   │   └── EventRepository.kt         internal interface (insertAll, getAll, deleteBySequences)
-│   └── upload/
-│       ├── EventUploader.kt           internal interface (upload(File): UploadResponse)
-│       ├── UploadFlushedEventsUseCase.kt  orchestrates the 6-step pipeline
-│       └── UploadResponse.kt          @Serializable — location field from API
-│
-├── data/
-│   ├── db/
-│   │   ├── EventEntity.kt             Room entity (id auto, name, timestamp, sequence, metadata)
-│   │   ├── EventDao.kt                insertAll, getAllOrdered, deleteBySequences
-│   │   ├── EventDatabase.kt
-│   │   ├── Mappers.kt                 TrackedEvent ↔ EventEntity
-│   │   └── MetadataConverter.kt       Map<String,String> ↔ JSON string for Room column
-│   ├── repository/
-│   │   └── EventRepositoryImpl.kt
-│   └── upload/
-│       ├── EventPayloadWriter.kt      List<TrackedEvent> → JSON array written to File
-│       ├── GzipCompressor.kt          streaming GZIP compress (inputFile → outputFile)
-│       ├── OkHttpEventUploader.kt     multipart/form-data POST; logs URL to Logcat
-│       └── TempFileManager.kt         creates/deletes temp files in context.cacheDir
-│
-└── di/
-    ├── DatabaseModule.kt
-    ├── IoDispatcher.kt / TrackerScope.kt   @Qualifier annotations
-    ├── RepositoryModule.kt
-    ├── ScopeModule.kt                 provisions CoroutineScope + IoDispatcher
-    ├── TrackerModule.kt               @Binds impl + @Named("flushInterval")
-    └── UploadModule.kt                OkHttpClient, Json (encodeDefaults=true), TempFileManager
-```
-
-The demo app lives in the top-level package alongside `MainActivity`:
-
-```
-MainViewModel.kt        @HiltViewModel wrapping ConcurrentEventTracker
-TrackerDemoScreen.kt    Compose UI: 4 buttons + status card
-```
+- Thread-safe event tracking from multiple callers
+- In-memory buffering
+- Automatic flush when:
+  - 5 events are buffered
+  - 10 seconds pass since the last flush
+- Room persistence
+- Ordered upload using SDK-assigned sequence numbers
+- JSON array payload generation
+- Stream-based GZIP compression
+- Multipart upload using OkHttp
+- Snapshot-safe deletion after successful upload
+- Unit tests covering concurrency, flushing, upload, JSON, compression, and networking
 
 ---
 
-## Concurrency Model
+## Architecture
 
+The SDK is organized into clear layers:
+
+```text
+sdk/
+├── ConcurrentEventTracker.kt
+├── ConcurrentEventTrackerImpl.kt
+├── TrackerCommand.kt
+│
+├── domain/
+│   ├── model/
+│   ├── repository/
+│   └── upload/
+│
+├── data/
+│   ├── db/
+│   ├── repository/
+│   └── upload/
+│
+└── di/
 ```
-trackEvent()  ──► Channel<TrackerCommand>(UNLIMITED) ──► single worker coroutine
-                                                              │
-                  ┌───────────────────────────────────────────┤
-                  │ Track(event)     → append to in-memory buffer
-                  │ Flush            → insertAll to Room, clear buffer
-                  │ FlushAndAck(ack) → insertAll, clear buffer, ack.complete(Unit)
-                  │ Shutdown         → final flush, cancel scope
-                  └───────────────────────────────────────────┘
+
+### Core Flow
+
+```text
+trackEvent()
+    → Channel<TrackerCommand>
+    → single worker coroutine
+    → in-memory buffer
+    → flush to Room
+    → upload pipeline
 ```
 
-**Key invariants:**
+### Concurrency Model
 
-- The mutable buffer is owned exclusively by the worker coroutine — no locks needed.
-- `trackEvent()` uses `channel.trySend()`, which never blocks. `Channel.UNLIMITED` means it never returns `false` until after shutdown.
-- Sequence numbers are stamped at `trackEvent()` time via `AtomicLong` — before the event enters the channel — preserving call-site ordering.
-- The shutdown guard (`AtomicBoolean`) prevents `trySend` from sending after the channel closes.
+- Uses a Channel + single worker coroutine, similar to an actor pattern
+- Only one coroutine owns the mutable buffer, so no locks are required
+- `trackEvent()` is non-blocking and uses `trySend`
+- Count-based flushes, timer flushes, manual flushes, and shutdown flushes are serialized through the same worker
 
-**Flush triggers:**
+This model avoids shared mutable state and makes flush, shutdown, and upload coordination deterministic and easy to reason about.
 
-| Trigger | Condition |
-|---|---|
-| Count-based | Every 5 events tracked |
-| Timer-based | Every 10 seconds (injectable via `@Named("flushInterval")`) |
-| Manual | `uploadFlushedEvents()` → `flushAndAwait()` |
-| Shutdown | `shutdown()` → final Flush before cancel |
+### Flush Triggers
+
+| Trigger     | Condition                 |
+|------------|---------------------------|
+| Count      | 5 buffered events          |
+| Timer      | 10 seconds                 |
+| Manual     | `uploadFlushedEvents()`    |
+| Shutdown   | `shutdown()`               |
 
 ---
 
 ## Upload Flow
 
-`uploadFlushedEvents()` executes 6 steps in order:
+`uploadFlushedEvents()` performs the following steps:
 
+1. Flush the in-memory buffer and wait for completion
+2. Read persisted events from Room in order
+3. Write the events as a JSON array to a temporary file
+4. Compress the JSON file using GZIP
+5. Upload the `.gz` file using multipart/form-data
+6. Delete only the uploaded rows after a successful upload
+7. Clean up temporary files in `finally`
+
+The forced flush before upload is important because events may still be buffered in memory below the automatic flush threshold.
+
+```text
+uploadFlushedEvents()
+    → flushAndAwait()
+    → read DB snapshot
+    → write JSON
+    → compress GZIP
+    → upload file
+    → delete uploaded snapshot
 ```
-1. flushAndAwait()
-   Send FlushAndAck to channel → suspend on CompletableDeferred until worker ACKs
-   ↓
-2. repository.getAllEvents()
-   Read current DB snapshot; capture sequence numbers (snapshot)
-   ↓
-3. EventPayloadWriter.write(events, jsonFile)
-   Serialize List<TrackedEvent.event> as a JSON array to a temp file
-   ↓
-4. GzipCompressor.compress(jsonFile, gzipFile)
-   Stream-compress jsonFile → gzipFile (avoids loading all bytes into memory)
-   ↓
-5. OkHttpEventUploader.upload(gzipFile)
-   POST multipart/form-data to https://api.escuelajs.co/api/v1/files/upload
-   Parse UploadResponse; log URL to Logcat with tag "EventTracker"
-   ↓
-6. repository.deleteEventsBySequences(snapshot)    ← only on success
-   fileManager.deleteQuietly(jsonFile, gzipFile)   ← always in finally
-```
 
-Step 1 is critical: without `FlushAndAck`, events tracked below the auto-flush threshold
-(still in memory) would be invisible to step 2 and silently missed.
-
----
-
-## Error Handling
-
-| Step that fails | DB rows deleted? | Temp files cleaned? |
-|---|---|---|
-| JSON write | No | Yes (finally) |
-| GZIP compress | No | Yes (finally) |
-| HTTP upload | No | Yes (finally) |
-| DB delete (after success) | Partial/None | Yes (finally) |
-
-All failures throw — the caller (`uploadFlushedEvents()`) propagates the exception to
-the coroutine that called it. No events are silently dropped.
-
-If the upload succeeds but the DB delete throws, those rows will be re-uploaded on the next
-call. A production SDK should use an idempotency key or an `uploadState` column to prevent
-duplicate delivery.
+Upload endpoint: `POST https://api.escuelajs.co/api/v1/files/upload`  
+Multipart field name: `file`  
+This is the endpoint provided with the assignment spec.
 
 ---
 
 ## Event Ordering
 
-Events are stamped with a monotonically increasing `sequence: Long` at `trackEvent()` time
-using `AtomicLong.getAndIncrement()`. Room reads use `ORDER BY sequence ASC`. This gives
-deterministic upload order regardless of system clock behavior or batching.
+Events are assigned a monotonic sequence number when they are accepted by the SDK.
+
+Room reads persisted events using `ORDER BY sequence ASC`, so uploads preserve SDK acceptance order rather than relying on timestamps.
+
+This matters because multiple events may share the same timestamp when they are created quickly.
 
 ---
 
-## Memory Safety
+## Snapshot-Safe Deletion
 
-Room and `TempFileManager` receive `applicationContext` and `context.cacheDir` respectively
-— never an Activity reference. The `@TrackerScope` `CoroutineScope` is Hilt-singleton so it
-survives configuration changes. The SDK holds no references to Activity, Fragment, or View.
+The upload flow captures a snapshot of the persisted events before uploading.
+
+After a successful upload, the SDK deletes only the sequence numbers from that snapshot.
+
+This avoids a common bug where newer events, flushed while an upload is already in progress, could be accidentally deleted.
+
+```text
+Correct:
+read snapshot [1, 2, 3]
+upload [1, 2, 3]
+delete only [1, 2, 3]
+
+Avoided:
+deleteAllEvents()
+```
+
+---
+
+## Error Handling
+
+| Failure Step        | DB Rows Deleted? | Temp Files Cleaned? |
+|--------------------|------------------|---------------------|
+| JSON write fails   | No               | Yes                 |
+| GZIP fails         | No               | Yes                 |
+| Upload fails       | No               | Yes                 |
+| DB delete fails    | No               | Yes                 |
+
+If JSON writing, compression, or upload fails, events remain in Room and can be retried later.
+
+If upload succeeds but DB deletion fails, those rows may be uploaded again on a later retry. A production SDK would solve this with upload state tracking or server-side idempotency.
+
+---
+
+## Memory and Lifecycle Safety
+
+- Room uses the application context
+- Temporary files are created in `context.cacheDir`
+- The SDK does not hold Activity, Fragment, View, or Lifecycle references
+- GZIP compression is stream-based to avoid loading the compressed file into memory
+- `shutdown()` is terminal for the current tracker instance
+
+Because `shutdown()` is non-suspending, the demo treats it as a terminal action and disables tracking/upload controls afterward. To create a new tracker instance, restart the demo app.
+
+---
+
+## Demo App
+
+The demo UI includes:
+
+- Track Single Event
+- Track 5 Events
+- Upload Flushed Events
+- Shutdown Tracker
+- Status card showing current state
+
+The UI is intentionally minimal and exists only as a manual smoke-test harness. Core correctness is covered by unit tests.
 
 ---
 
 ## How to Run
 
-1. Open the project in Android Studio.
-2. Connect a device or start an emulator.
-3. Run the `app` configuration.
-4. The demo screen appears immediately.
+Open the project in Android Studio and run the app on an emulator or device.
 
 ---
 
@@ -189,7 +215,7 @@ survives configuration changes. The SDK holds no references to Activity, Fragmen
 ./gradlew :app:testDebugUnitTest
 ```
 
-Individual suites:
+Useful individual test commands:
 
 ```bash
 ./gradlew :app:testDebugUnitTest --tests "*.ConcurrentEventTrackerImplTest"
@@ -200,84 +226,117 @@ Individual suites:
 ./gradlew :app:testDebugUnitTest --tests "*.OkHttpEventUploaderTest"
 ```
 
-86 tests, all passing.
-
-| Suite | Count | Focus |
-|---|---|---|
-| ConcurrentEventTrackerImplTest | 32 | trackEvent, count/timer flush, concurrency, ordering, shutdown |
-| ConcurrentEventTrackerUploadTest | 8 | End-to-end upload, buffer-before-DB proof, snapshot safety |
-| UploadFlushedEventsUseCaseTest | 20 | All failure paths, snapshot safety, payload shape |
-| EventPayloadWriterTest | 8 | JSON shape, special chars, empty metadata, no internal fields |
-| GzipCompressorTest | 6 | Round-trip, empty input, missing input, streaming |
-| OkHttpEventUploaderTest | 11 | MockWebServer: POST, multipart shape, response parsing, error cases |
-
 ---
 
-## How to Manually Verify Upload
+## Manual Upload Verification
 
-1. Run the app on a device or emulator.
-2. Open Logcat and filter by tag: **`EventTracker`**
-3. Tap **Track Single Event** three times (3 events — below the 5-event auto-flush threshold, stays in memory).
-4. Tap **Upload Flushed Events**.
-5. The status card shows "Uploading…" then "Upload complete — GZIP URL logged".
-6. Logcat shows: `Upload complete: https://api.escuelajs.co/…`
-7. Tap **Track 5 Events** — this hits the count-based auto-flush (events go to Room automatically).
-8. Tap **Upload Flushed Events** again — verifies DB-persisted events also upload correctly.
+To manually verify a generated upload:
+
+1. Run the app
+2. Track several events
+3. Tap Upload Flushed Events
+4. Copy the uploaded `.gz` URL from Logcat (tag: `ConcurrentEventTracker`)
+5. Run:
+
+```bash
+curl -L -o events.gz "PASTE_UPLOADED_GZ_URL_HERE"
+
+file events.gz
+
+gzip -t events.gz
+
+gunzip -c events.gz > events.json
+
+cat events.json | python3 -m json.tool
+```
+
+Expected payload shape:
+
+```json
+[
+  {
+    "name": "button_tap",
+    "timestamp": 123456789,
+    "metadata": {
+      "source": "demo_ui"
+    }
+  }
+]
+```
+
+The uploaded payload should include only event data:
+
+- `name`
+- `timestamp`
+- `metadata`
+
+It should not include internal persistence fields such as database IDs or sequence numbers.
 
 ---
 
 ## AI Usage
 
-This project was developed with AI assistance (Claude Sonnet via Claude Code CLI).
+I used AI assistance as a development aid during this assignment, mainly for:
 
-**What AI did:**
+- brainstorming architecture and edge cases
+- generating initial boilerplate for tests and DI setup
+- reviewing failure paths around flushing, upload, cleanup, and retry behavior
+- helping refine documentation and test coverage
 
-- Generated boilerplate for DI modules, Room entity/DAO, and Hilt annotations
-- Suggested the `Channel<TrackerCommand>` actor pattern for thread safety
-- Drafted the `FlushAndAck(ack: CompletableDeferred<Unit>)` mechanism for synchronizing upload with the in-memory buffer
-- Wrote test scaffolding: `FakeEventRepository`, `FakeEventUploader`, `ThrowingEventPayloadWriter`, `ThrowingGzipCompressor`
-- Discovered MockWebServer 5.1.0 API changes via `javap` decompilation (setter methods, `SocketPolicy` enum, `RecordedRequest.body` as `okio.Buffer`)
-- Wrote the full test suite (86 tests across 6 suites)
-- Drafted this README
+All implementation decisions were reviewed and validated manually. In particular, I focused on understanding and verifying:
 
-**What I reviewed and decided:**
+- the channel-based concurrency model
+- the flush-before-upload synchronization
+- ordered persistence using sequence numbers
+- snapshot-safe deletion
+- JSON, GZIP, and multipart upload behavior
+- failure behavior across the upload pipeline
 
-- `deleteEventsBySequences(snapshot)` not `deleteAll()` — snapshot safety is a deliberate design choice
-- `try/finally` not `runCatching` — to avoid swallowing `CancellationException`
-- `Channel.UNLIMITED` not bounded — bounded channels back-pressure `trackEvent()` on the UI thread, which is unacceptable in an SDK
-- `encodeDefaults = true` in Json — required so `metadata: emptyMap()` serializes as `{}` not omitted
-- `@param:IoDispatcher` annotation target — resolves a Kotlin/Hilt ambiguity warning on qualifier annotations
-- Non-blocking `shutdown()` — matches the assignment spec; limitation is documented
+The final code, tests, and design tradeoffs reflect my own review and debugging process.
 
 ---
 
-## Design Tradeoffs
+## Known Limitations
 
-**Channel vs Mutex**: A `Mutex` requires every accessor to acquire it. With a channel, only one coroutine ever touches the buffer — no lock contention, naturally composable, cancellation-aware.
+### Non-suspending shutdown
 
-**`deleteEventsBySequences` vs `deleteAll`**: Events flushed to Room during an in-flight upload get new sequence numbers outside the snapshot. `deleteAll` would drop them silently. The targeted delete is always safe.
+`shutdown()` is non-suspending because that is the assignment API. It performs a best-effort graceful shutdown for the current tracker instance.
 
-**No Retrofit**: There is one upload endpoint. A full service interface adds indirection without value. OkHttp is hidden behind `EventUploader` so it is replaceable without touching the use case.
+A production SDK might expose a suspending close API or return a completion signal so callers can deterministically wait for the final flush.
 
----
+### Manual upload trigger
 
-## Known Limitations / TODOs
+Uploads are triggered manually through `uploadFlushedEvents()`.
 
-- **Delete-after-upload failure**: If upload succeeds but the DB delete throws, events will be re-uploaded on the next call. Fix: server-side idempotency key or `uploadState` column (`PENDING → UPLOADING → UPLOADED`).
-- **`shutdown()` is best-effort**: Non-suspending by design. The caller cannot await the final flush. Fix: expose `suspend fun shutdown()` or return `Job`.
-- **No WorkManager**: Upload is manually triggered. If the process dies during upload, the next call retries from DB. Fix: `PeriodicWorkRequest` with network/battery constraints.
-- **No DAO/Room unit tests**: `EventDao` tests require Robolectric or instrumented tests — not included. Candidates: `dao_getAllOrdered_returnsAscendingSequence`, `dao_deleteBySequences_deletesOnlyMatchingRows`.
-- **No retry/backoff**: Failed uploads propagate immediately. Fix: exponential backoff loop in `UploadFlushedEventsUseCase`.
+A production analytics SDK would likely use WorkManager for scheduled and retryable background uploads.
+
+### Delete-after-upload failure
+
+If upload succeeds but deleting rows from Room fails, those rows may be uploaded again on retry.
+
+A production system should use server-side idempotency keys, batch IDs, or an upload state column.
+
+### DB read failure at startup
+
+If the initial sequence initialization query throws (for example, due to DB corruption), the worker coroutine fails silently. Events continue to be accepted by `trackEvent()` and queued in the channel, but nothing processes them. A production SDK should catch this failure and fall back to a safe default sequence value.
+
+### Process death before flush
+
+Events already persisted in Room survive process death. Events still buffered in memory may be lost if the process is killed before a flush occurs.
+
+A production SDK could persist events immediately or use a more durable queue depending on requirements.
 
 ---
 
 ## If I Had More Time
 
-- Exponential backoff on upload failure
-- WorkManager integration for guaranteed background delivery
-- Upload state column (`PENDING → UPLOADING → UPLOADED`) to handle retry safely
-- Server-side idempotency key (batch UUID in the multipart form field)
-- Chunked / streaming JSON for large event backlogs (10k+ events)
-- Encryption / metadata redaction filter
-- Per-event immediate persistence option for full process-death resilience
-- Metrics/callback interface so the host app can observe upload success/failure
+- WorkManager integration for guaranteed background upload
+- Retry with exponential backoff
+- Upload state column such as `PENDING`, `UPLOADING`, and `UPLOADED`
+- Server-side idempotency key or batch ID
+- Streaming JSON generation for very large event queues
+- Chunked uploads for very large payloads
+- Metadata redaction or encryption for sensitive analytics data
+- Observable callbacks or listener interface for upload and flush results
+- Separate SDK Gradle module for clearer app/SDK boundaries
+- Builder or factory initialization API for apps that do not use Hilt
