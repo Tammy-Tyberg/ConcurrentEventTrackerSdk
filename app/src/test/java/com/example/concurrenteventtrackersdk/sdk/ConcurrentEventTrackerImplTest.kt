@@ -58,13 +58,6 @@ class ConcurrentEventTrackerImplTest {
         trackerScope.cancel() // safety net if test throws before finally
     }
 
-    /**
-     * Wraps runTest and guarantees trackerScope is cancelled inside a finally block.
-     * This prevents the infinite timer loop from hanging runTest's post-body scheduler drain.
-     *
-     * With UnconfinedTestDispatcher, shutdown()'s internal scope.launch runs inline, so
-     * assertions placed immediately after tracker.shutdown() are safe.
-     */
     private fun makeUploadUseCase(): UploadFlushedEventsUseCase {
         val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
         val tempDir = kotlin.io.path.createTempDirectory("tracker-impl-test").toFile()
