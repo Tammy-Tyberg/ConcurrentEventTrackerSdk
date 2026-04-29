@@ -17,9 +17,22 @@ internal class FakeEventRepository : EventRepository {
         _events.addAll(events)
     }
 
-    override suspend fun getAllEvents(): List<TrackedEvent> = _events.toList()
+    override suspend fun getAllEventsOrdered(): List<TrackedEvent> = _events.toList()
 
     override suspend fun deleteAllEvents() {
         _events.clear()
+    }
+
+    val deletedSequences = mutableListOf<Long>()
+    var shouldThrowOnDelete = false
+
+    override suspend fun deleteEventsBySequences(sequences: List<Long>) {
+        if (shouldThrowOnDelete) throw RuntimeException("DB delete failed: simulated")
+        deletedSequences.addAll(sequences)
+        _events.removeAll { it.sequence in sequences }
+    }
+
+    fun insertDirectly(events: List<TrackedEvent>) {
+        _events.addAll(events)
     }
 }

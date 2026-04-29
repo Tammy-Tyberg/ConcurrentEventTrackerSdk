@@ -1,6 +1,10 @@
 package com.example.concurrenteventtrackersdk.sdk
 
+import com.example.concurrenteventtrackersdk.sdk.data.upload.EventPayloadWriter
+import com.example.concurrenteventtrackersdk.sdk.data.upload.GzipCompressor
+import com.example.concurrenteventtrackersdk.sdk.data.upload.TempFileManager
 import com.example.concurrenteventtrackersdk.sdk.domain.model.Event
+import com.example.concurrenteventtrackersdk.sdk.domain.upload.UploadFlushedEventsUseCase
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
@@ -13,6 +17,7 @@ import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.json.Json
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -60,11 +65,29 @@ class ConcurrentEventTrackerImplTest {
      * With UnconfinedTestDispatcher, shutdown()'s internal scope.launch runs inline, so
      * assertions placed immediately after tracker.shutdown() are safe.
      */
+    private fun makeUploadUseCase(): UploadFlushedEventsUseCase {
+        val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
+        val tempDir = createTempDir("tracker-impl-test")
+        return UploadFlushedEventsUseCase(
+            repository = fakeRepository,
+            payloadWriter = EventPayloadWriter(json),
+            compressor = GzipCompressor(),
+            uploader = FakeEventUploader(),
+            fileManager = TempFileManager(tempDir),
+            ioDispatcher = testDispatcher
+        )
+    }
+
     private fun test(
         flushInterval: Long = 100L,
         block: suspend TestScope.(ConcurrentEventTrackerImpl) -> Unit
     ) = runTest(testDispatcher) {
-        val tracker = ConcurrentEventTrackerImpl(fakeRepository, trackerScope, flushInterval)
+        val tracker = ConcurrentEventTrackerImpl(
+            repository = fakeRepository,
+            uploadUseCase = makeUploadUseCase(),
+            scope = trackerScope,
+            flushIntervalMillis = flushInterval
+        )
         try {
             block(tracker)
         } finally {
