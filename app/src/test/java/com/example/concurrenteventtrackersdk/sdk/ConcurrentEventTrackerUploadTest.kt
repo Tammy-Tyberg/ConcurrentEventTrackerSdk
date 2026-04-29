@@ -230,15 +230,32 @@ class ConcurrentEventTrackerUploadTest {
     // -------------------------------------------------------------------------
 
     @Test
-    fun `upload after shutdown - upload sees events flushed by shutdown`() = runTest(testDispatcher) {
+    fun `upload after shutdown - shutdown flushes events to DB`() = runTest(testDispatcher) {
         val tracker = makeTracker(flushInterval = 10_000L)
         try {
             tracker.trackEvent(Event("shutdown_event"))
             tracker.shutdown()
-            // After shutdown the scope is cancelled, so uploadFlushedEvents would fail.
-            // This test documents that shutdown and upload are mutually exclusive operations.
-            // If you need to upload before shutdown, call uploadFlushedEvents() first.
+            // Shutdown flushes the buffer; upload must be called before shutdown.
             assertEquals(1, fakeRepository.events.size)
+        } finally {
+            trackerScope.cancel()
+        }
+    }
+
+    @Test
+    fun `uploadFlushedEvents after shutdown throws`() = runTest(testDispatcher) {
+        val tracker = makeTracker(flushInterval = 10_000L)
+        try {
+            tracker.shutdown()
+            // With UnconfinedTestDispatcher shutdown runs inline, so the channel is already
+            // closed by the time uploadFlushedEvents() is called.
+            var threw = false
+            try {
+                tracker.uploadFlushedEvents()
+            } catch (e: Exception) {
+                threw = true
+            }
+            assertTrue("uploadFlushedEvents() after shutdown must throw", threw)
         } finally {
             trackerScope.cancel()
         }

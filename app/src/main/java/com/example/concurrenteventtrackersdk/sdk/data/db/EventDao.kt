@@ -18,4 +18,7 @@ interface EventDao {
 
     @Query("DELETE FROM events WHERE sequence IN (:sequences)")
     suspend fun deleteBySequences(sequences: List<Long>)
+
+    @Query("SELECT MAX(sequence) FROM events")
+    suspend fun getMaxSequence(): Long?
 }

@@ -24,4 +24,6 @@ internal class EventRepositoryImpl @Inject constructor(
 
     override suspend fun deleteEventsBySequences(sequences: List<Long>) =
         dao.deleteBySequences(sequences)
+
+    override suspend fun getMaxSequence(): Long? = dao.getMaxSequence()
 }

@@ -8,4 +8,7 @@ internal interface EventRepository {
     suspend fun deleteAllEvents()
     /** Deletes only the rows whose sequence numbers match the uploaded snapshot. */
     suspend fun deleteEventsBySequences(sequences: List<Long>)
+
+    /** Returns the highest sequence number in the DB, or null if the table is empty. */
+    suspend fun getMaxSequence(): Long?
 }

@@ -17,8 +17,6 @@ internal class FakeEventRepository : EventRepository {
         _events.addAll(events)
     }
 
-    override suspend fun getAllEventsOrdered(): List<TrackedEvent> = _events.toList()
-
     override suspend fun deleteAllEvents() {
         _events.clear()
     }
@@ -35,4 +33,9 @@ internal class FakeEventRepository : EventRepository {
     fun insertDirectly(events: List<TrackedEvent>) {
         _events.addAll(events)
     }
+
+    override suspend fun getMaxSequence(): Long? = _events.maxOfOrNull { it.sequence }
+
+    override suspend fun getAllEventsOrdered(): List<TrackedEvent> =
+        _events.sortedBy { it.sequence }
 }

@@ -1,11 +1,11 @@
 package com.example.concurrenteventtrackersdk.sdk
 
-import android.util.Log
 import com.example.concurrenteventtrackersdk.sdk.di.TrackerScope
 import com.example.concurrenteventtrackersdk.sdk.domain.model.Event
 import com.example.concurrenteventtrackersdk.sdk.domain.model.TrackedEvent
 import com.example.concurrenteventtrackersdk.sdk.domain.repository.EventRepository
 import com.example.concurrenteventtrackersdk.sdk.domain.upload.UploadFlushedEventsUseCase
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -16,7 +16,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
 import javax.inject.Inject
 import javax.inject.Named
 import javax.inject.Singleton
@@ -24,9 +23,14 @@ import javax.inject.Singleton
 /**
  * Channel/actor architecture:
  *
- * - trackEvent() stamps a monotonic sequence number and sends a Track command.
- *   It never touches the buffer directly.
- * - One worker coroutine owns the mutable buffer — no locking needed.
+ * - trackEvent() sends the raw Event through the channel. The worker owns all mutable
+ *   state: the in-memory buffer and the sequence counter.
+ * - One worker coroutine assigns sequence numbers, so they are always monotonically
+ *   increasing without any locking.
+ * - On startup the worker reads MAX(sequence) from the DB so sequence numbers never
+ *   collide with rows persisted in a previous session. Without this, a process restart
+ *   would generate sequences starting at 0 again, causing deleteEventsBySequences to
+ *   silently delete newly-tracked events that share a sequence with old DB rows.
  * - Timer and shutdown send commands instead of touching shared state.
  * - Count flush, timer flush, and shutdown flush are all serialised through the worker.
  * - Room reads ORDER BY sequence ASC, so multi-batch ordering is always correct.
@@ -49,7 +53,6 @@ internal class ConcurrentEventTrackerImpl @Inject constructor(
     @param:Named("flushInterval") private val flushIntervalMillis: Long
 ) : ConcurrentEventTracker {
 
-    private val sequence = AtomicLong(0L)
     private val isShutdown = AtomicBoolean(false)
     private val channel = Channel<TrackerCommand>(Channel.UNLIMITED)
 
@@ -63,25 +66,22 @@ internal class ConcurrentEventTrackerImpl @Inject constructor(
 
     override fun trackEvent(event: Event) {
         if (isShutdown.get()) return
-
-        val tracked = TrackedEvent(
-            event = event,
-            sequence = sequence.getAndIncrement()
-        )
-
-        channel.trySend(TrackerCommand.Track(tracked))
+        channel.trySend(TrackerCommand.Track(event))
             .onFailure {
                 // Channel is closed only after shutdown; event is intentionally dropped.
             }
     }
 
     private fun startWorker(): Job = scope.launch {
+        // Initialize from the highest persisted sequence so new events never collide with
+        // DB rows from a previous session.
+        var nextSequence = (repository.getMaxSequence() ?: -1L) + 1L
         val buffer = mutableListOf<TrackedEvent>()
 
         loop@ for (command in channel) {
             when (command) {
                 is TrackerCommand.Track -> {
-                    buffer.add(command.event)
+                    buffer.add(TrackedEvent(event = command.event, sequence = nextSequence++))
                     if (buffer.size >= MAX_BUFFER_SIZE) flushBuffer(buffer)
                 }
                 TrackerCommand.Flush -> flushBuffer(buffer)
@@ -117,8 +117,9 @@ internal class ConcurrentEventTrackerImpl @Inject constructor(
             val batch = buffer.toList()
             repository.insertEvents(batch)
             buffer.clear()
-            Log.d("EventTracker", "Flushed ${batch.size} events to Room (sequences ${batch.first().sequence}–${batch.last().sequence})")
             true
+        } catch (e: CancellationException) {
+            throw e
         } catch (exception: Exception) {
             // Keep buffer intact so a future Flush/Shutdown can retry.
             // TODO: log/report exception in production via callback or metrics.
