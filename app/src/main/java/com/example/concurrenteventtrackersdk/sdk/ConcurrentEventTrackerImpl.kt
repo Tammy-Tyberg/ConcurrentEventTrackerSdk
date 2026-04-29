@@ -15,6 +15,7 @@ import kotlinx.coroutines.channels.onFailure
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import android.util.Log
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
 import javax.inject.Named
@@ -94,6 +95,7 @@ internal class ConcurrentEventTrackerImpl @Inject constructor(
             val batch = buffer.toList()
             repository.insertEvents(batch)
             buffer.clear()
+            Log.d(TAG, "Flushed ${batch.size} events to Room")
             true
         } catch (e: CancellationException) {
             throw e
@@ -127,5 +129,6 @@ internal class ConcurrentEventTrackerImpl @Inject constructor(
 
     private companion object {
         const val MAX_BUFFER_SIZE = 5
+        const val TAG = "ConcurrentEventTracker"
     }
 }

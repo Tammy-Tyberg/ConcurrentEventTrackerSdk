@@ -43,7 +43,7 @@ internal class OkHttpEventUploader(
             val body = response.body?.string()?.takeIf { it.isNotBlank() }
                 ?: throw IOException("Empty response body from upload endpoint")
             json.decodeFromString<UploadResponse>(body).also { result ->
-                Log.d(TAG, "Upload complete: ${result.location}")
+                Log.d(TAG, "Upload success (code=${response.code}): ${result.location}")
             }
         }
     }
