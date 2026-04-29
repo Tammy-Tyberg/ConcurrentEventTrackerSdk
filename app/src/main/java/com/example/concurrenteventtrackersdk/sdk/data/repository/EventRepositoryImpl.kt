@@ -16,8 +16,12 @@ internal class EventRepositoryImpl @Inject constructor(
     override suspend fun insertEvents(events: List<TrackedEvent>) =
         dao.insertAll(events.map { it.toEntity() })
 
-    override suspend fun getAllEvents(): List<TrackedEvent> =
+    override suspend fun getAllEventsOrdered(): List<TrackedEvent> =
         dao.getAllOrdered().map { it.toTrackedEvent() }
 
     override suspend fun deleteAllEvents() = dao.deleteAll()
+
+
+    override suspend fun deleteEventsBySequences(sequences: List<Long>) =
+        dao.deleteBySequences(sequences)
 }

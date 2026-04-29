@@ -1,9 +1,12 @@
 package com.example.concurrenteventtrackersdk.sdk
 
+import android.util.Log
 import com.example.concurrenteventtrackersdk.sdk.di.TrackerScope
 import com.example.concurrenteventtrackersdk.sdk.domain.model.Event
 import com.example.concurrenteventtrackersdk.sdk.domain.model.TrackedEvent
 import com.example.concurrenteventtrackersdk.sdk.domain.repository.EventRepository
+import com.example.concurrenteventtrackersdk.sdk.domain.upload.UploadFlushedEventsUseCase
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
@@ -41,6 +44,7 @@ import javax.inject.Singleton
 @Singleton
 internal class ConcurrentEventTrackerImpl @Inject constructor(
     private val repository: EventRepository,
+    private val uploadUseCase: UploadFlushedEventsUseCase,
     @param:TrackerScope private val scope: CoroutineScope,
     @param:Named("flushInterval") private val flushIntervalMillis: Long
 ) : ConcurrentEventTracker {
@@ -81,6 +85,15 @@ internal class ConcurrentEventTrackerImpl @Inject constructor(
                     if (buffer.size >= MAX_BUFFER_SIZE) flushBuffer(buffer)
                 }
                 TrackerCommand.Flush -> flushBuffer(buffer)
+                is TrackerCommand.FlushAndAck -> {
+                    if (flushBuffer(buffer)) {
+                        command.ack.complete(Unit)
+                    } else {
+                        command.ack.completeExceptionally(
+                            IllegalStateException("Room insert failed; events retained for retry")
+                        )
+                    }
+                }
                 TrackerCommand.Shutdown -> {
                     flushBuffer(buffer)
                     channel.close()
@@ -98,20 +111,30 @@ internal class ConcurrentEventTrackerImpl @Inject constructor(
         }
     }
 
-    private suspend fun flushBuffer(buffer: MutableList<TrackedEvent>) {
-        if (buffer.isEmpty()) return
-        try {
+    private suspend fun flushBuffer(buffer: MutableList<TrackedEvent>): Boolean {
+        if (buffer.isEmpty()) return true
+        return try {
             val batch = buffer.toList()
             repository.insertEvents(batch)
             buffer.clear()
+            Log.d("EventTracker", "Flushed ${batch.size} events to Room (sequences ${batch.first().sequence}–${batch.last().sequence})")
+            true
         } catch (exception: Exception) {
             // Keep buffer intact so a future Flush/Shutdown can retry.
             // TODO: log/report exception in production via callback or metrics.
+            false
         }
     }
 
     override suspend fun uploadFlushedEvents() {
-        // TODO Step 2: force-flush buffer → DB, read all, JSON, GZIP, POST, delete on success.
+        flushAndAwait()
+        uploadUseCase()
+    }
+
+    private suspend fun flushAndAwait() {
+        val ack = CompletableDeferred<Unit>()
+        channel.send(TrackerCommand.FlushAndAck(ack))
+        ack.await()
     }
 
     override fun shutdown() {

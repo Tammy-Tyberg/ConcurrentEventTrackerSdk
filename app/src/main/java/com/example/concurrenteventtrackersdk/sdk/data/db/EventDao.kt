@@ -15,4 +15,7 @@ interface EventDao {
 
     @Query("DELETE FROM events")
     suspend fun deleteAll()
+
+    @Query("DELETE FROM events WHERE sequence IN (:sequences)")
+    suspend fun deleteBySequences(sequences: List<Long>)
 }
