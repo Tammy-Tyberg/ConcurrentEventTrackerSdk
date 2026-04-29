@@ -105,7 +105,7 @@ fun TrackerDemoScreen(viewModel: MainViewModel = hiltViewModel()) {
                 if (uiState.statusMessage.contains("Logcat")) {
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "Filter Logcat by tag: EventTracker",
+                        text = "Filter Logcat by tag: ConcurrentEventTracker",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.primary
                     )

@@ -2,7 +2,7 @@ package com.example.concurrenteventtrackersdk.sdk.data.upload
 
 import java.io.File
 
-// Takes cacheDir as a File rather than Context so it can be unit-tested without Android runtime.
+// cacheDir as File (not Context) keeps this testable without the Android runtime.
 internal class TempFileManager(private val cacheDir: File) {
 
     fun createTempFile(prefix: String, suffix: String): File =

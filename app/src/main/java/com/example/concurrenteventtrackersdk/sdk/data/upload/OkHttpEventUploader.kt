@@ -1,5 +1,6 @@
 package com.example.concurrenteventtrackersdk.sdk.data.upload
 
+import android.util.Log
 import com.example.concurrenteventtrackersdk.sdk.domain.upload.EventUploader
 import com.example.concurrenteventtrackersdk.sdk.domain.upload.UploadResponse
 import kotlinx.coroutines.CoroutineDispatcher
@@ -41,7 +42,13 @@ internal class OkHttpEventUploader(
             }
             val body = response.body?.string()?.takeIf { it.isNotBlank() }
                 ?: throw IOException("Empty response body from upload endpoint")
-            json.decodeFromString<UploadResponse>(body)
+            json.decodeFromString<UploadResponse>(body).also { result ->
+                Log.d(TAG, "Upload complete: ${result.location}")
+            }
         }
+    }
+
+    private companion object {
+        const val TAG = "ConcurrentEventTracker"
     }
 }
